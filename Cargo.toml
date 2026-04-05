@@ -1,0 +1,13 @@
+[package]
+name = "wgpu_01"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "29.0.1"
+winit = "0.30"
+pollster = "0.4.0"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+
+
