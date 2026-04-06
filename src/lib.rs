@@ -14,10 +14,8 @@ const CIRCLE_RADIUS: f32 = 0.015;
 const BALL_COUNT: usize = 1600;
 const SMOOTHING_RADIUS: f32 = 0.2;
 const MASS: f32 = 1.0;
-const SPACING: f32 = 0.03;
-const NUMBER_BALLS_SIDE: u32 = 40;
 const TARGET_DENSITY: f32 = 0.0000001;
-const PRESSURE_MULTIPLIER: f32 = 300.0;
+const PRESSURE_MULTIPLIER: f32 = 500.0;
 const GRAVITY: f32 = 2.81;
 
 // --- Types ---
@@ -111,7 +109,6 @@ fn calculate_density(sample_point: [f32; 2], positions: &[[f32; 2]]) -> f32 {
 }
 
 fn density_to_pressure(density: f32) -> f32 {
-    // FIX: Only positive pressure (repulsion). Prevents clumping/attraction.
     f32::max(0.0, (density - TARGET_DENSITY) * PRESSURE_MULTIPLIER)
 }
 
@@ -304,23 +301,40 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
+
+        //randomize
+        use rand::Rng; 
+        let mut rng = rand::thread_rng();
         let mut balls = Vec::new();
-        for row in 0..NUMBER_BALLS_SIDE {
-            for col in 0..NUMBER_BALLS_SIDE {
-                balls.push(Ball {
-                    position: [-0.5 + col as f32 * SPACING, 0.8 - row as f32 * SPACING],
-                    velocity: [0.0, 0.0],
-                });
-            }
+
+        let ball_count = 900;
+        
+        let spawn_range = -0.8..0.8; 
+
+        for _ in 0..ball_count {
+            balls.push(Ball {
+                position: [
+                    rng.gen_range(spawn_range.clone()), 
+                    rng.gen_range(spawn_range.clone()), 
+                ],
+                velocity: [0.0, 0.0],
+            });
         }
-        Self { state: None, gravity_on: false, balls, last_frame: std::time::Instant::now() }
+
+        Self { 
+            state: None, 
+            gravity_on: false, 
+            balls, 
+            last_frame: std::time::Instant::now() 
+        }
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
     if self.state.is_none() {
-        let window = event_loop.create_window(Window::default_attributes().with_title("SPH Fluid")).unwrap();
+        use winit::dpi::LogicalSize;
+        let window = event_loop.create_window(Window::default_attributes().with_title("SPH Fluid").with_inner_size(LogicalSize::new(1200.0, 800.0))).unwrap();
         let state = pollster::block_on(State::new(window));
         state.window.request_redraw();  
         self.state = Some(state);
@@ -356,7 +370,6 @@ impl ApplicationHandler for App {
                     ball.position[0] += ball.velocity[0] * dt;
                     ball.position[1] += ball.velocity[1] * dt;
 
-                    // FIX: Bouncing with damping (0.5 energy loss)
                     let bounce = -0.5;
                     let margin = 1.0 - CIRCLE_RADIUS;
                     if ball.position[1].abs() > margin {
