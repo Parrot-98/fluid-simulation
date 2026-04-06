@@ -1,4 +1,3 @@
-use std::f32::consts::PI;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -10,9 +9,18 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const CIRCLE_RADIUS: f32 = 0.01;
-const BALL_COUNT: usize = 100000;
+// --- Constants ---
+const CIRCLE_RADIUS: f32 = 0.015;
+const BALL_COUNT: usize = 1600;
+const SMOOTHING_RADIUS: f32 = 0.2;
+const MASS: f32 = 1.0;
+const SPACING: f32 = 0.03;
+const NUMBER_BALLS_SIDE: u32 = 40;
+const TARGET_DENSITY: f32 = 0.0000001;
+const PRESSURE_MULTIPLIER: f32 = 300.0;
+const GRAVITY: f32 = 2.81;
 
+// --- Types ---
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -21,9 +29,7 @@ pub struct Vertex {
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
-
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -40,9 +46,7 @@ pub struct InstanceData {
 }
 
 impl InstanceData {
-    const ATTRIBS: [wgpu::VertexAttribute; 1] =
-        wgpu::vertex_attr_array![2 => Float32x2];
-
+    const ATTRIBS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Float32x2];
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<InstanceData>() as wgpu::BufferAddress,
@@ -57,23 +61,18 @@ pub struct Ball {
     pub velocity: [f32; 2],
 }
 
-fn build_circle(
-    segments: u32,
-    radius: f32,
-    aspect: f32,
-    cx: f32,
-    cy: f32,
-    color: [f32; 3],
-) -> (Vec<Vertex>, Vec<u16>) {
-    let mut vertices: Vec<Vertex> = Vec::with_capacity((segments + 2) as usize);
-    let mut indices: Vec<u16> = Vec::with_capacity((segments * 3) as usize);
 
-    vertices.push(Vertex { position: [cx, cy], color });
+fn build_circle(segments: u32, radius: f32, aspect: f32, color: [f32; 3]) -> (Vec<Vertex>, Vec<u16>) {
+    let mut vertices = Vec::with_capacity((segments + 2) as usize);
+    let mut indices = Vec::with_capacity((segments * 3) as usize);
+
+    vertices.push(Vertex { position: [0.0, 0.0], color });
 
     for i in 0..=segments {
         let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        // Apply aspect ratio correction to the vertex positions
         vertices.push(Vertex {
-            position: [cx + (angle.cos() * radius) / aspect, cy + angle.sin() * radius],
+            position: [(angle.cos() * radius) / aspect, angle.sin() * radius],
             color,
         });
     }
@@ -83,29 +82,75 @@ fn build_circle(
         indices.push((i + 1) as u16);
         indices.push((i + 2) as u16);
     }
-
     (vertices, indices)
 }
 
+// Physics 
+fn smoothing_kernel(radius: f32, dst: f32) -> f32 {
+    if dst >= radius { return 0.0; }
+    let value = radius * radius - dst * dst;
+    value * value * value
+}
+
+fn smoothing_kernel_derivative(radius: f32, dst: f32) -> f32 {
+    if dst >= radius || dst < 0.00001 { return 0.0; }
+    let scale = -6.0 * dst;
+    let v = radius * radius - dst * dst;
+    scale * v * v
+}
+
+fn calculate_density(sample_point: [f32; 2], positions: &[[f32; 2]]) -> f32 {
+    let mut density = 0.0;
+    for position in positions {
+        let dx = position[0] - sample_point[0];
+        let dy = position[1] - sample_point[1];
+        let dst = (dx * dx + dy * dy).sqrt();
+        density += MASS * smoothing_kernel(SMOOTHING_RADIUS, dst);
+    }
+    density
+}
+
+fn density_to_pressure(density: f32) -> f32 {
+    // FIX: Only positive pressure (repulsion). Prevents clumping/attraction.
+    f32::max(0.0, (density - TARGET_DENSITY) * PRESSURE_MULTIPLIER)
+}
+
+fn calculate_pressure_force(ball_idx: usize, positions: &[[f32; 2]], densities: &[f32]) -> [f32; 2] {
+    let mut force = [0.0f32; 2];
+    let p_idx = positions[ball_idx];
+    let rho_idx = densities[ball_idx];
+    let pres_idx = density_to_pressure(rho_idx);
+
+    for i in 0..positions.len() {
+        if i == ball_idx { continue; }
+        let dx = positions[i][0] - p_idx[0];
+        let dy = positions[i][1] - p_idx[1];
+        let dst = (dx * dx + dy * dy).sqrt();
+
+        if dst < SMOOTHING_RADIUS && dst > 0.0001 {
+            let nx = dx / dst;
+            let ny = dy / dst;
+            let slope = smoothing_kernel_derivative(SMOOTHING_RADIUS, dst);
+            let shared_pressure = (pres_idx + density_to_pressure(densities[i])) / 2.0;
+            
+            // Standard SPH Pressure Gradient
+            force[0] += shared_pressure * nx * slope * MASS / densities[i];
+            force[1] += shared_pressure * ny * slope * MASS / densities[i];
+        }
+    }
+    force
+}
+
+// --- Shader ---
 const SHADER_SRC: &str = r#"
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) color:    vec3<f32>,
-}
-
-struct InstanceInput {
-    @location(2) offset: vec2<f32>,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0)       color:         vec3<f32>,
-}
+struct VertexInput { @location(0) position: vec2<f32>, @location(1) color: vec3<f32> }
+struct InstanceInput { @location(2) offset: vec2<f32> }
+struct VertexOutput { @builtin(position) clip_pos: vec4<f32>, @location(0) color: vec3<f32> }
 
 @vertex
 fn vs_main(in: VertexInput, inst: InstanceInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position + inst.offset, 0.0, 1.0);
+    out.clip_pos = vec4<f32>(in.position + inst.offset, 0.0, 1.0);
     out.color = in.color;
     return out;
 }
@@ -116,6 +161,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+// --- WGPU State ---
 pub struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -123,7 +169,6 @@ pub struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pub size: PhysicalSize<u32>,
-
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -135,74 +180,37 @@ impl State {
     pub async fn new(window: Window) -> Self {
         let window = Arc::new(window);
         let size = window.inner_size();
+        let instance = wgpu::Instance::default(); 
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            flags: wgpu::InstanceFlags::empty(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        });
+        let surface = instance.create_surface(Arc::clone(&window)).unwrap();
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }).await.unwrap();
 
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .expect("Failed to create surface");
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("Failed to find adapter");
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .expect("Failed to create device");
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
+            format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Circle Shader"),
+            label: None,
             source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Pipeline Layout"),
-            bind_group_layouts: &[],
-            immediate_size: 0,
-        });
-
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Circle Pipeline"),
-            layout: Some(&pipeline_layout),
+            label: None,
+            layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -219,33 +227,15 @@ impl State {
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
         });
 
-        // Temporary placeholder vertex/index buffers — replaced by rebuild_buffers()
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&[Vertex { position: [0.0, 0.0], color: [0.0; 3] }]),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&[0u16]),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        // Instance buffer — holds one offset per ball, updated every frame
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 1024, usage: wgpu::BufferUsages::VERTEX, mapped_at_creation: false });
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 1024, usage: wgpu::BufferUsages::INDEX, mapped_at_creation: false });
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Instance Buffer"),
             size: (BALL_COUNT * std::mem::size_of::<InstanceData>()) as u64,
@@ -253,130 +243,58 @@ impl State {
             mapped_at_creation: false,
         });
 
-        let mut state = Self {
-            window,
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            instance_buffer,
-            num_indices: 0,
-        };
-
+        let mut state = Self { window, surface, device, queue, config, size, render_pipeline, vertex_buffer, index_buffer, instance_buffer, num_indices: 0 };
         state.rebuild_buffers();
         state
     }
 
     pub fn rebuild_buffers(&mut self) {
         let aspect = self.size.width as f32 / self.size.height as f32;
-        let (all_vertices, all_indices) =
-            build_circle(64, CIRCLE_RADIUS, aspect, 0.0, 0.0, [0.2, 0.4, 1.0]);
-
+        let (v, i) = build_circle(32, CIRCLE_RADIUS, aspect, [0.3, 0.6, 1.0]);
         self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&all_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            label: None, contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::VERTEX,
         });
-
         self.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&all_indices),
-            usage: wgpu::BufferUsages::INDEX,
+            label: None, contents: bytemuck::cast_slice(&i), usage: wgpu::BufferUsages::INDEX,
         });
-
-        self.num_indices = all_indices.len() as u32;
+        self.num_indices = i.len() as u32;
     }
 
-    pub fn update_instances(&mut self, balls: &[Ball]) {
-        let instances: Vec<InstanceData> = balls
-            .iter()
-            .map(|b| InstanceData { offset: b.position })
-            .collect();
-        self.queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances),
-        );
-    }
-
-    pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-            self.rebuild_buffers();
-        }
-    }
-
-    pub fn reconfigure(&mut self) {
-        self.resize(self.size);
-    }
-
-    pub fn render(&mut self) -> bool {
+    pub fn render(&mut self, balls: &[Ball]) {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.reconfigure();
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded => return false,
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost => {
-                self.reconfigure();
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return false,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            _ => return,
         };
-
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.05,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 ..Default::default()
             });
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..BALL_COUNT as u32);
+            rp.set_pipeline(&self.render_pipeline);
+            rp.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            rp.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            rp.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            // Draw only the current number of balls
+            rp.draw_indexed(0..self.num_indices, 0, 0..balls.len() as u32);
         }
 
+        let instances: Vec<InstanceData> = balls.iter().map(|b| InstanceData { offset: b.position }).collect();
+        self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        true
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
     }
 }
 
+// --- Application Logic ---
 pub struct App {
     state: Option<State>,
     gravity_on: bool,
@@ -384,131 +302,82 @@ pub struct App {
     last_frame: std::time::Instant,
 }
 
-const SMOOTHING_RADIUS: f32 = 0.2;
-const MASS: f32 = 1.0;
-
-fn smoothing_kernel(radius: f32, dst: f32) -> f32 {
-    let value = f32::max(0.0, radius * radius - dst * dst);
-    value * value * value
-}
-
-fn calculate_density(sample_point: [f32; 2], positions: &[[f32; 2]]) -> f32 {
-    let mut density = 0.0;
-
-    for position in positions {
-        let dx = position[0] - sample_point[0];
-        let dy = position[1] - sample_point[1];
-        let dst = (dx * dx + dy * dy).sqrt();  // magnitude
-        let influence = smoothing_kernel(SMOOTHING_RADIUS, dst);
-        density += MASS * influence;
-    }
-
-    density
-}
-
-
-const SPACING: f32 = 0.02;
-const NUMBER_BALLS_SIDE: u32 = 50;
-
 impl Default for App {
     fn default() -> Self {
         let mut balls = Vec::new();
         for row in 0..NUMBER_BALLS_SIDE {
             for col in 0..NUMBER_BALLS_SIDE {
                 balls.push(Ball {
-                    position: [
-                        -0.9 + col as f32 * SPACING,
-                        0.9 - row as f32 * SPACING,
-                    ],
+                    position: [-0.5 + col as f32 * SPACING, 0.8 - row as f32 * SPACING],
                     velocity: [0.0, 0.0],
                 });
             }
         }
-        Self {
-            state: None,
-            gravity_on: false,
-            balls,
-            last_frame: std::time::Instant::now(),
-        }
+        Self { state: None, gravity_on: false, balls, last_frame: std::time::Instant::now() }
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_none() {
-            let window = event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("wgpu circles")
-                        .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 800.0))
-                )
-                .unwrap();
-            self.state = Some(pollster::block_on(State::new(window)));
-        }
+    if self.state.is_none() {
+        let window = event_loop.create_window(Window::default_attributes().with_title("SPH Fluid")).unwrap();
+        let state = pollster::block_on(State::new(window));
+        state.window.request_redraw();  
+        self.state = Some(state);
     }
+}
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = self.state.as_mut() else { return };
-
+        let state = self.state.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-
-            WindowEvent::Resized(new_size) => state.resize(new_size),
-
-            WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    physical_key: PhysicalKey::Code(key),
-                    state: ElementState::Pressed,
-                    ..
-                },
-                ..
-            } => match key {
-                KeyCode::Escape => event_loop.exit(),
+            WindowEvent::Resized(s) => { state.config.width = s.width; state.config.height = s.height; state.surface.configure(&state.device, &state.config); state.size = s; state.rebuild_buffers(); }
+            WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(key), state: ElementState::Pressed, .. }, .. } => match key {
                 KeyCode::KeyG => self.gravity_on = !self.gravity_on,
-                KeyCode::Space => {
-                    if self.gravity_on {
-                        for ball in &mut self.balls {
-                            ball.velocity[1] = 1.5;
-                        }
-                    }
-                }
+                KeyCode::Space => self.balls.iter_mut().for_each(|b| b.velocity[1] = 2.0),
                 _ => {}
             },
-
             WindowEvent::RedrawRequested => {
                 let now = std::time::Instant::now();
-                let dt = now.duration_since(self.last_frame).as_secs_f32();
+                let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.016);
                 self.last_frame = now;
 
-                if self.gravity_on {
-                    const GRAVITY: f32 = 4.0;
-                    let floor_limit = -1.0 + CIRCLE_RADIUS;
+                let positions: Vec<[f32; 2]> = self.balls.iter().map(|b| b.position).collect();
+                let densities: Vec<f32> = positions.iter().map(|&p| calculate_density(p, &positions)).collect();
 
-                    for ball in &mut self.balls {
-                        ball.velocity[1] -= GRAVITY * dt;
-                        let new_y = ball.position[1] + ball.velocity[1] * dt;
+                for i in 0..self.balls.len() {
+                    let f = calculate_pressure_force(i, &positions, &densities);
+                    self.balls[i].velocity[0] += f[0] * dt;
+                    self.balls[i].velocity[1] += f[1] * dt;
+                    if self.gravity_on { self.balls[i].velocity[1] -= GRAVITY * dt; }
+                }
 
-                        if new_y < floor_limit {
-                            ball.position[1] = floor_limit;
-                            ball.velocity[1] *= -0.5;
-                        } else {
-                            ball.position[1] = new_y;
-                        }
+                for ball in &mut self.balls {
+                    ball.position[0] += ball.velocity[0] * dt;
+                    ball.position[1] += ball.velocity[1] * dt;
+
+                    // FIX: Bouncing with damping (0.5 energy loss)
+                    let bounce = -0.5;
+                    let margin = 1.0 - CIRCLE_RADIUS;
+                    if ball.position[1].abs() > margin {
+                        ball.position[1] = margin * ball.position[1].signum();
+                        ball.velocity[1] *= bounce;
+                    }
+                    if ball.position[0].abs() > margin {
+                        ball.position[0] = margin * ball.position[0].signum();
+                        ball.velocity[0] *= bounce;
                     }
                 }
 
-                state.update_instances(&self.balls);
-                state.render();
-                state.window().request_redraw();
+                state.render(&self.balls);
+                state.window.request_redraw();
             }
-
             _ => {}
         }
     }
 }
 
 pub fn run() {
-    env_logger::init();
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
