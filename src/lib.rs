@@ -399,6 +399,7 @@ impl Default for App {
     }
 }
 
+//everyth
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
     if self.state.is_none() {
@@ -406,7 +407,7 @@ impl ApplicationHandler for App {
             .create_window(
                 Window::default_attributes()
                     .with_title("wgpu circles")
-                    .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 800.0)) 
+                    .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 800.0)) // window dimentions <---------------------------------------------------------
             )
             .unwrap();
         self.state = Some(pollster::block_on(State::new(window)));
