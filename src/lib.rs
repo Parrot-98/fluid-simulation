@@ -17,6 +17,7 @@ const MASS: f32 = 1.0;
 const TARGET_DENSITY: f32 = 0.0000001;
 const PRESSURE_MULTIPLIER: f32 = 500.0;
 const GRAVITY: f32 = 2.81;
+const VISCOSITY_STRENGTH: f32 = 10.0;
 
 // --- Types ---
 #[repr(C)]
@@ -136,6 +137,32 @@ fn calculate_pressure_force(ball_idx: usize, positions: &[[f32; 2]], densities: 
         }
     }
     force
+}
+
+fn calculate_viscosity_force(ball_idx: usize, balls: &[Ball], densities: &[f32]) -> [f32; 2] {
+    let mut viscosity_force = [0.0f32; 2];
+    let p_idx = balls[ball_idx].position;
+    let v_idx = balls[ball_idx].velocity;
+
+    for i in 0..balls.len() {
+        if i == ball_idx { continue; }
+        
+        let dx = balls[i].position[0] - p_idx[0];
+        let dy = balls[i].position[1] - p_idx[1];
+        let dst = (dx * dx + dy * dy).sqrt();
+
+        if dst < SMOOTHING_RADIUS && dst > 0.0001 {
+            let weight = smoothing_kernel(SMOOTHING_RADIUS, dst);
+            
+            // Relative velocity
+            let rel_v_x = balls[i].velocity[0] - v_idx[0];
+            let rel_v_y = balls[i].velocity[1] - v_idx[1];
+
+            viscosity_force[0] += VISCOSITY_STRENGTH * MASS * rel_v_x * weight / densities[i];
+            viscosity_force[1] += VISCOSITY_STRENGTH * MASS * rel_v_y * weight / densities[i];
+        }
+    }
+    viscosity_force
 }
 
 // --- Shader ---
@@ -360,9 +387,10 @@ impl ApplicationHandler for App {
                 let densities: Vec<f32> = positions.iter().map(|&p| calculate_density(p, &positions)).collect();
 
                 for i in 0..self.balls.len() {
-                    let f = calculate_pressure_force(i, &positions, &densities);
-                    self.balls[i].velocity[0] += f[0] * dt;
-                    self.balls[i].velocity[1] += f[1] * dt;
+                    let pressure = calculate_pressure_force(i, &positions, &densities);
+                    let viscosity = calculate_viscosity_force(i, &self.balls, &densities);
+                    self.balls[i].velocity[0] += pressure[0] + viscosity[0] *  dt;
+                    self.balls[i].velocity[1] += pressure[1] + viscosity[1] * dt;
                     if self.gravity_on { self.balls[i].velocity[1] -= GRAVITY * dt; }
                 }
 
